@@ -23,7 +23,7 @@ from .abstract import AbstractEplbPolicy
 class DefaultEplbPolicy(AbstractEplbPolicy):
     @classmethod
     def balanced_packing(
-        cls, weight: torch.Tensor, num_packs: int
+        cls, weight: np.ndarray, num_packs: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Pack n weighted objects to m packs, such that each bin contains exactly
@@ -41,22 +41,16 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
         assert num_groups % num_packs == 0
         groups_per_pack = num_groups // num_packs
 
-        device = weight.device
-
         if groups_per_pack == 1:
-            pack_index = torch.arange(
-                weight.size(-1), dtype=torch.int64, device=device
-            ).expand(weight.shape)
-            rank_in_pack = torch.zeros_like(weight, dtype=torch.int64, device=device)
+            pack_index = np.tile(np.arange(num_groups, dtype=np.int64), (num_layers, 1))
+            rank_in_pack = np.zeros((num_layers, num_groups), dtype=np.int64)
             return pack_index, rank_in_pack
 
-        weight_np = weight.cpu().numpy()
-
         # Sort and get indices in decending order
-        indices_np = np.argsort(-weight_np, axis=-1)
+        indices = np.argsort(-weight, axis=-1)
 
-        pack_index_np = np.full((num_layers, num_groups), -1, dtype=np.int64)
-        rank_in_pack_np = np.full((num_layers, num_groups), -1, dtype=np.int64)
+        pack_index = np.full((num_layers, num_groups), -1, dtype=np.int64)
+        rank_in_pack = np.full((num_layers, num_groups), -1, dtype=np.int64)
 
         # Run the packing algorithm
         for i in range(num_layers):
@@ -65,32 +59,29 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
             heap = [(0.0, pack_id, 0) for pack_id in range(num_packs)]
             heapq.heapify(heap)
 
-            for group in indices_np[i]:
+            for group in indices[i]:
                 # Pop the pack with minimum weight
                 current_weight, pack_id, num_items = heapq.heappop(heap)
 
                 # Assign group to this pack
                 assert num_items < groups_per_pack
-                pack_index_np[i, group] = pack_id
-                rank_in_pack_np[i, group] = num_items
+                pack_index[i, group] = pack_id
+                rank_in_pack[i, group] = num_items
 
                 # Update pack weight and item count
-                new_weight = current_weight + weight_np[i, group].item()
+                new_weight = current_weight + float(weight[i, group])
                 new_num_items = num_items + 1
 
                 # Push back to heap if pack is not full
                 if new_num_items < groups_per_pack:
                     heapq.heappush(heap, (new_weight, pack_id, new_num_items))
 
-        pack_index = torch.from_numpy(pack_index_np).to(device)
-        rank_in_pack = torch.from_numpy(rank_in_pack_np).to(device)
-
         return pack_index, rank_in_pack
 
     @classmethod
     def replicate_experts(
-        cls, weight: torch.Tensor, num_phy: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cls, weight: np.ndarray, num_phy: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Replicate `num_log` experts to `num_phy` replicas, such that the maximum
         load of all replicas is minimized.
@@ -107,13 +98,12 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
         n, num_log = weight.shape
         num_redundant = num_phy - num_log
         assert num_redundant >= 0
-        device = weight.device
-        phy2log = torch.arange(num_phy, dtype=torch.int64, device=device).repeat(n, 1)
-        rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
-        logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
-        arangen = torch.arange(n, dtype=torch.int64, device=device)
+        phy2log = np.tile(np.arange(num_phy, dtype=np.int64), (n, 1))
+        rank = np.zeros((n, num_phy), dtype=np.int64)
+        logcnt = np.ones((n, num_log), dtype=np.int64)
+        arangen = np.arange(n, dtype=np.int64)
         for i in range(num_log, num_phy):
-            redundant_indices = (weight / logcnt).max(dim=-1).indices
+            redundant_indices = np.argmax(weight / logcnt, axis=-1)
             phy2log[:, i] = redundant_indices
             rank[:, i] = logcnt[arangen, redundant_indices]
             logcnt[arangen, redundant_indices] += 1
@@ -122,12 +112,12 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
     @classmethod
     def rebalance_experts_hierarchical(
         cls,
-        weight: torch.Tensor,
+        weight: np.ndarray,
         num_physical_experts: int,
         num_groups: int,
         num_nodes: int,
         num_gpus: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Parameters:
             weight: [num_moe_layers, num_logical_experts]
@@ -154,66 +144,74 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
         assert num_physical_experts % num_gpus == 0
         phy_experts_per_gpu = num_physical_experts // num_gpus
 
-        def inverse(perm: torch.Tensor) -> torch.Tensor:
-            inv = torch.empty_like(perm)
-            inv.scatter_(
-                1,
-                perm,
-                torch.arange(
-                    perm.size(1), dtype=torch.int64, device=perm.device
-                ).expand(perm.shape),
-            )
+        def inverse(perm: np.ndarray) -> np.ndarray:
+            inv = np.empty_like(perm)
+            for i in range(perm.shape[0]):
+                inv[i, perm[i]] = np.arange(perm.shape[1], dtype=np.int64)
             return inv
 
         # Step 1: pack groups to nodes
-        tokens_per_group = weight.unflatten(-1, (num_groups, group_size)).sum(-1)
+        tokens_per_group = weight.reshape(num_layers, num_groups, group_size).sum(
+            axis=-1
+        )
         group_pack_index, group_rank_in_pack = cls.balanced_packing(
             tokens_per_group, num_nodes
         )
         log2mlog = (
-            (
-                (group_pack_index * groups_per_node + group_rank_in_pack) * group_size
-            ).unsqueeze(-1)
-            + torch.arange(
-                group_size, dtype=torch.int64, device=group_pack_index.device
-            )
-        ).flatten(-2)
+            (group_pack_index * groups_per_node + group_rank_in_pack)[:, :, np.newaxis]
+            * group_size
+            + np.arange(group_size, dtype=np.int64)
+        ).reshape(num_layers, -1)
         mlog2log = inverse(log2mlog)
 
         # Step 2: construct redundant experts within nodes
         # [num_layers * num_nodes, num_logical_experts // num_nodes]
-        tokens_per_mlog = weight.gather(-1, mlog2log).view(
-            -1, num_logical_experts // num_nodes
+        tokens_per_mlog = np.empty(
+            (num_layers, num_logical_experts), dtype=weight.dtype
         )
+        for i in range(num_layers):
+            tokens_per_mlog[i] = weight[i, mlog2log[i]]
+        tokens_per_mlog = tokens_per_mlog.reshape(-1, num_logical_experts // num_nodes)
         phy2mlog, phyrank, mlogcnt = cls.replicate_experts(
             tokens_per_mlog, num_physical_experts // num_nodes
         )
 
         # Step 3: pack physical_experts to GPUs
         # [num_layers * num_nodes, num_physical_experts // num_nodes]
-        tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)
+        tokens_per_phy = np.empty_like(phy2mlog, dtype=weight.dtype)
+        for i in range(tokens_per_phy.shape[0]):
+            tokens_per_phy[i] = (tokens_per_mlog[i] / mlogcnt[i])[phy2mlog[i]]
         pack_index, rank_in_pack = cls.balanced_packing(
             tokens_per_phy, num_gpus // num_nodes
         )
         phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
         pphy2phy = inverse(phy2pphy)
 
-        pphy2mlog = phy2mlog.gather(
-            -1, pphy2phy
-        )  # [num_layers * num_nodes, num_log_per_nodes]
+        pphy2mlog = np.empty_like(phy2mlog)
+        for i in range(pphy2mlog.shape[0]):
+            pphy2mlog[i] = phy2mlog[i, pphy2phy[i]]
         pphy2mlog = (
-            pphy2mlog.view(num_layers, num_nodes, -1)
-            + torch.arange(
-                0,
-                num_logical_experts,
-                num_logical_experts // num_nodes,
-                device=group_pack_index.device,
-            ).view(1, -1, 1)
-        ).flatten(-2)
-        pphy2log = mlog2log.gather(-1, pphy2mlog)
-        pphyrank = phyrank.gather(-1, pphy2phy).view(num_layers, -1)
-        logcnt = mlogcnt.view(num_layers, -1).gather(-1, log2mlog)
-        return pphy2log, pphyrank, logcnt
+            pphy2mlog.reshape(num_layers, num_nodes, -1)
+            + np.arange(
+                0, num_logical_experts, num_logical_experts // num_nodes, dtype=np.int64
+            ).reshape(1, -1, 1)
+        ).reshape(num_layers, -1)
+
+        pphy2log = np.empty_like(pphy2mlog)
+        for i in range(num_layers):
+            pphy2log[i] = mlog2log[i, pphy2mlog[i]]
+
+        pphyrank = np.empty_like(phyrank)
+        for i in range(pphyrank.shape[0]):
+            pphyrank[i] = phyrank[i, pphy2phy[i]]
+        pphyrank = pphyrank.reshape(num_layers, -1)
+
+        logcnt = mlogcnt.reshape(num_layers, -1)
+        logcnt_reordered = np.empty_like(logcnt)
+        for i in range(num_layers):
+            logcnt_reordered[i] = logcnt[i, log2mlog[i]]
+
+        return pphy2log, pphyrank, logcnt_reordered
 
     @classmethod
     def rebalance_experts(
@@ -246,30 +244,43 @@ class DefaultEplbPolicy(AbstractEplbPolicy):
                 physical replicas for each logical expert
         """
         num_layers, num_logical_experts = weight.shape
-        weight = weight.float()
+        device = weight.device
+
+        # Convert input tensor to numpy
+        weight_np = weight.float().cpu().numpy()
+
         if num_groups % num_nodes == 0:
             # use hierarchical load-balance policy
             phy2log, phyrank, logcnt = cls.rebalance_experts_hierarchical(
-                weight, num_replicas, num_groups, num_nodes, num_ranks
+                weight_np, num_replicas, num_groups, num_nodes, num_ranks
             )
         else:
             # use global load-balance policy
             phy2log, phyrank, logcnt = cls.rebalance_experts_hierarchical(
-                weight, num_replicas, 1, 1, num_ranks
+                weight_np, num_replicas, 1, 1, num_ranks
             )
         num_redundant_experts = num_replicas - num_logical_experts
         maxlogcnt = num_redundant_experts + 1
-        log2phy: torch.Tensor = torch.full(
+        log2phy = np.full(
             (num_layers, num_logical_experts, maxlogcnt),
             -1,
-            dtype=torch.int64,
-            device=logcnt.device,
+            dtype=np.int64,
         )
-        log2phy.view(num_layers, -1).scatter_(
-            -1,
-            phy2log * maxlogcnt + phyrank,
-            torch.arange(num_replicas, dtype=torch.int64, device=log2phy.device).expand(
-                num_layers, -1
-            ),
+
+        # Scatter operation using numpy (equivalent to PyTorch's view().scatter_())
+        # Create a view once, then modify it (modifications affect the original log2phy)
+        log2phy_view = log2phy.reshape(num_layers, -1)
+        flat_indices = phy2log * maxlogcnt + phyrank
+        replica_indices = np.tile(
+            np.arange(num_replicas, dtype=np.int64), (num_layers, 1)
         )
+
+        for i in range(num_layers):
+            log2phy_view[i, flat_indices[i]] = replica_indices[i]
+
+        # Convert results back to tensors
+        phy2log = torch.from_numpy(phy2log).to(device)
+        log2phy = torch.from_numpy(log2phy).to(device)
+        logcnt = torch.from_numpy(logcnt).to(device)
+
         return phy2log, log2phy, logcnt
